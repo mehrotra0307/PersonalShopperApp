@@ -93,37 +93,3 @@ PersonalShopperApp/
 
 The proxy pre-warms a session at container startup to avoid the 12-second session initialization delay on the first user request.
 
----
-
-## Running Locally
-
-### Android App
-Open the project in Android Studio and run on a device or emulator. The app connects to the deployed Cloud Run proxy by default.
-
-### Cloud Proxy (local test)
-```bash
-cd cloud_proxy
-pip install -r requirements.txt
-gcloud auth application-default login
-uvicorn main:app --reload --port 8080
-```
-
-### Deploy Proxy to Cloud Run
-```bash
-gcloud run deploy personal-shopper-proxy \
-  --source cloud_proxy \
-  --region us-central1 \
-  --project personal-shopper-agent \
-  --allow-unauthenticated \
-  --memory 512Mi \
-  --timeout 300
-```
-
----
-
-## Security Notes
-
-- `local.properties` is excluded from git (contains local SDK path)
-- No API keys or credentials are hardcoded anywhere
-- The Cloud Run proxy uses GCP Application Default Credentials (service account identity)
-- The Android app only talks to the Cloud Run URL — no GCP credentials on device
