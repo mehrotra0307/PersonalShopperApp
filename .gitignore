@@ -1,0 +1,37 @@
+# Android
+local.properties
+*.keystore
+keystore.properties
+/app/release/
+/app/debug/
+*.apk
+*.aab
+
+# Gradle
+.gradle/
+build/
+**/build/
+**/.gradle/
+
+# Android Studio / IntelliJ
+.idea/
+.DS_Store
+
+# Google credentials / secrets
+google-services.json
+service-account-key*.json
+*.env
+.env*
+credentials.json
+gcloud-key*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# Cloud proxy
+cloud_proxy/__pycache__/

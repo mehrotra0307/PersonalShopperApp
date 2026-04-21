@@ -1,0 +1,1 @@
+-keep class com.ashish.personalshopperagent.data.model.** { *; }
