@@ -1,5 +1,8 @@
 """
-Cloud Run proxy: Android app → this → Vertex AI Agent Engine
+Cloud Run proxy: Android app → this → Vertex AI Agent Engine (ADK multi-agent)
+
+Each streamQuery call advances the ADK agent one "round" (tool call or response).
+We loop until the synthesizer emits text or we hit max rounds.
 """
 
 import json
@@ -27,6 +30,9 @@ BASE = (
     f"/reasoningEngines/{RESOURCE_ID}"
 )
 
+MAX_ROUNDS = 10
+ROUND_WAIT_SECS = 8
+
 
 class QueryRequest(BaseModel):
     message: str
@@ -44,15 +50,7 @@ def auth_headers(token: str) -> dict:
     return {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
 
-def extract_text(raw: str) -> str:
-    """
-    Extract only the synthesizer's final answer from the NDJSON event stream.
-    The parallel sub-agents emit intermediate text during tool execution.
-    We only want text from AFTER the last tool response (= synthesizer output).
-    """
-    print(f"[extract] body len={len(raw)} | first 600:\n{raw[:600]}\n---")
-
-    # Parse all events (handles both NDJSON and JSON array)
+def parse_events(raw: str) -> list:
     events = []
     for line in raw.splitlines():
         line = line.strip()
@@ -66,107 +64,123 @@ def extract_text(raw: str) -> str:
                 events.append(parsed)
         except Exception:
             pass
-
     if not events:
         try:
             parsed = json.loads(raw.strip())
             events = parsed if isinstance(parsed, list) else [parsed]
         except Exception:
             pass
-
-    print(f"[extract] parsed {len(events)} events")
-
-    # Find the index of the last event containing a tool response/call
-    last_tool_idx = -1
-    for i, ev in enumerate(events):
-        parts = ev.get("content", {}).get("parts", [])
-        for part in parts:
-            # camelCase (Vertex AI JSON serialization)
-            if "functionResponse" in part or "functionCall" in part:
-                last_tool_idx = i
-            # snake_case fallback
-            if "function_response" in part or "function_call" in part:
-                last_tool_idx = i
-
-    print(f"[extract] last tool event index: {last_tool_idx} of {len(events)-1}")
-
-    # Collect text only from events AFTER the last tool event (synthesizer output)
-    synth_texts = []
-    all_texts = []
-    for i, ev in enumerate(events):
-        for part in ev.get("content", {}).get("parts", []):
-            txt = part.get("text", "")
-            if txt:
-                all_texts.append(txt)
-                if i > last_tool_idx:
-                    synth_texts.append(txt)
-
-    # Prefer synthesizer-only text; fall back to all text if nothing found
-    texts = synth_texts if synth_texts else all_texts
-    result = "".join(texts)
-    print(f"[extract] synth chunks={len(synth_texts)} all chunks={len(all_texts)} result len={len(result)}")
-    if result:
-        print(f"[extract] preview: {result[:300]}")
-    return result if result else "Agent returned no text. Please try again."
+    return events
 
 
-async def create_session(token: str) -> tuple[str, str]:
-    """Create a fresh session. Returns (session_id, user_id)."""
+def extract_text(events: list) -> str:
+    """
+    Extract synthesized text from ADK events.
+    The synthesizer emits a text part after all tool calls complete.
+    """
+    # Strategy 1: top-level text field (some agent SDKs)
+    for ev in reversed(events):
+        for key in ("output", "response", "text", "answer", "result"):
+            val = ev.get(key)
+            if isinstance(val, str) and val.strip():
+                return val.strip()
+
+    # Strategy 2: content.parts[].text (ADK standard format)
+    # Only take text from events that are NOT tool call/response events
+    text_parts = []
+    for ev in events:
+        content = ev.get("content", {})
+        if not isinstance(content, dict):
+            continue
+        parts = content.get("parts", [])
+        has_tool = any("function_call" in p or "function_response" in p for p in parts)
+        if has_tool:
+            continue
+        for p in parts:
+            txt = p.get("text", "")
+            if txt and txt.strip():
+                text_parts.append(txt)
+
+    return "".join(text_parts)
+
+
+async def create_session(client: httpx.AsyncClient, token: str) -> tuple[str, str]:
     user_id = f"user_{int(time.time())}"
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        r = await client.post(
-            f"{BASE}/sessions",
-            headers=auth_headers(token),
-            json={"userId": user_id},
-        )
+    r = await client.post(
+        f"{BASE}/sessions",
+        headers=auth_headers(token),
+        json={"userId": user_id},
+    )
     if r.status_code != 200:
         raise HTTPException(500, f"Session creation failed ({r.status_code}): {r.text[:200]}")
 
     data = r.json()
-    print(f"[session] create response: {json.dumps(data)[:300]}")
+    print(f"[session] response: {json.dumps(data)[:300]}")
     parts = data.get("name", "").split("/")
     try:
         session_id = parts[parts.index("sessions") + 1]
     except (ValueError, IndexError):
         raise HTTPException(500, f"Could not parse session_id from: {data.get('name')}")
 
-    print(f"[session] created session_id={session_id} user_id={user_id}, waiting 8s...")
-    await asyncio.sleep(8)
+    print(f"[session] created session_id={session_id}, waiting 12s...")
+    await asyncio.sleep(12)
     return session_id, user_id
 
 
 @app.on_event("startup")
 async def startup():
-    print("Proxy started — session will be created on first request.")
+    print("Proxy started.")
 
 
 @app.post("/query")
 async def query_agent(request: QueryRequest):
     token = get_token()
 
-    # Fresh session per query — avoids stale conversation state
-    session_id, user_id = await create_session(token)
-    print(f"[query] session_id={session_id} | message={request.message[:80]}")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        session_id, user_id = await create_session(client, token)
+        print(f"[query] session_id={session_id} | message={request.message[:80]}")
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
-        r = await client.post(
-            f"{BASE}:streamQuery",
-            headers=auth_headers(token),
-            json={
-                "input": {
-                    "user_id": user_id,
-                    "session_id": session_id,
-                    "message": request.message,
-                }
-            },
-        )
+        payload = {
+            "input": {
+                "user_id": user_id,
+                "session_id": session_id,
+                "message": request.message,
+            }
+        }
 
-    print(f"[query] streamQuery status={r.status_code}")
+        for round_num in range(1, MAX_ROUNDS + 1):
+            print(f"[round {round_num}] calling streamQuery...")
+            r = await client.post(
+                f"{BASE}:streamQuery",
+                headers=auth_headers(token),
+                json=payload,
+            )
+            print(f"[round {round_num}] status={r.status_code}, bytes={len(r.text)}")
 
-    if r.status_code != 200:
-        raise HTTPException(r.status_code, f"Agent error: {r.text[:300]}")
+            if r.status_code != 200:
+                raise HTTPException(r.status_code, f"Agent error: {r.text[:300]}")
 
-    return {"result": extract_text(r.text)}
+            events = parse_events(r.text)
+            print(f"[round {round_num}] events={len(events)}")
+
+            for ev in events:
+                author = ev.get("author", "?")
+                content = ev.get("content", {})
+                parts = content.get("parts", []) if isinstance(content, dict) else []
+                part_types = [list(p.keys()) for p in parts]
+                print(f"  {author}: {part_types}")
+
+            text = extract_text(events)
+            if text:
+                print(f"[round {round_num}] GOT TEXT len={len(text)}: {text[:200]}")
+                return {"result": text}
+
+            if round_num < MAX_ROUNDS:
+                print(f"[round {round_num}] no text yet, waiting {ROUND_WAIT_SECS}s...")
+                await asyncio.sleep(ROUND_WAIT_SECS)
+
+    print(f"[query] exhausted {MAX_ROUNDS} rounds with no text")
+    return {"result": "Agent returned no text. Please try again."}
 
 
 @app.get("/health")
