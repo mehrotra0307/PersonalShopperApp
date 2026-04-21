@@ -31,7 +31,7 @@ BASE = (
 )
 
 MAX_ROUNDS = 10
-ROUND_WAIT_SECS = 8
+ROUND_WAIT_SECS = 5
 
 
 class QueryRequest(BaseModel):
@@ -86,7 +86,8 @@ def extract_text(events: list) -> str:
                 return val.strip()
 
     # Strategy 2: content.parts[].text (ADK standard format)
-    # Only take text from events that are NOT tool call/response events
+    # Only take text from events that are NOT tool call/response events,
+    # and skip chunks that are internal agent "waiting" messages.
     text_parts = []
     for ev in events:
         content = ev.get("content", {})
@@ -98,10 +99,29 @@ def extract_text(events: list) -> str:
             continue
         for p in parts:
             txt = p.get("text", "")
-            if txt and txt.strip():
-                text_parts.append(txt)
+            if not txt or not txt.strip():
+                continue
+            if _is_waiting_message(txt):
+                print(f"[extract] skipping waiting message: {txt[:100]}")
+                continue
+            text_parts.append(txt)
 
     return "".join(text_parts)
+
+
+def _is_waiting_message(text: str) -> bool:
+    """Returns True if this is an internal agent 'still waiting for tool' message."""
+    lower = text.lower()
+    return any(phrase in lower for phrase in (
+        "i am still waiting",
+        "still waiting for the results",
+        "waiting for the previous request",
+        "previous request to complete",
+        "i cannot fulfill this request",
+        "i'm unable to fulfill",
+        "i already executed",
+        "already executed the `",
+    ))
 
 
 async def create_session(client: httpx.AsyncClient, token: str) -> tuple[str, str]:
