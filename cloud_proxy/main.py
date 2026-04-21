@@ -2,9 +2,10 @@
 Cloud Run proxy: Android app → this → Vertex AI Agent Engine (ADK multi-agent)
 
 Each streamQuery call advances the ADK agent one "round" (tool call or response).
-We loop until the synthesizer emits text or we hit max rounds.
+We loop collecting substantial text from all agents, stop when synthesis is done.
 """
 
+import re
 import json
 import time
 import asyncio
@@ -30,8 +31,29 @@ BASE = (
     f"/reasoningEngines/{RESOURCE_ID}"
 )
 
-MAX_ROUNDS = 10
+MAX_ROUNDS = 12
 ROUND_WAIT_SECS = 5
+# Only count text as real synthesis if it's at least this long
+MIN_SYNTHESIS_LEN = 250
+
+# Patterns that indicate intermediate agent status, not real synthesis
+_INTERMEDIATE_PATTERNS = [
+    r"^please wait",
+    r"^i am (currently )?(?:searching|looking|fetching|gathering)",
+    r"^i'm (currently )?(?:searching|looking|fetching|gathering)",
+    r"^i am still waiting",
+    r"^i'm sorry.*(?:cannot|can't) fulfill",
+    r"^i am sorry.*(?:cannot|can't) fulfill",
+    r"^i (?:cannot|can't) fulfill this request",
+    r"^i have already executed",
+    r"^i'm unable to",
+    r"^searching for",
+    r"^fetching",
+    r"^gathering",
+]
+_INTERMEDIATE_RE = re.compile(
+    "|".join(_INTERMEDIATE_PATTERNS), re.IGNORECASE
+)
 
 
 class QueryRequest(BaseModel):
@@ -73,86 +95,43 @@ def parse_events(raw: str) -> list:
     return events
 
 
-def extract_text(events: list) -> str:
+def extract_synthesis_text(events: list) -> str:
     """
-    Extract synthesized text from ADK events.
-    The synthesizer emits a text part after all tool calls complete.
+    Extract only genuine synthesis text from a round's events.
+    Returns empty string if this round only has tool calls / intermediate messages.
     """
-    # Strategy 1: top-level text field (some agent SDKs)
-    for ev in reversed(events):
-        for key in ("output", "response", "text", "answer", "result"):
-            val = ev.get(key)
-            if isinstance(val, str) and val.strip():
-                return val.strip()
-
-    # Strategy 2: content.parts[].text (ADK standard format)
-    # Only take text from events that are NOT tool call/response events,
-    # and skip chunks that are internal agent "waiting" messages.
-    text_parts = []
+    text_chunks = []
     for ev in events:
         content = ev.get("content", {})
         if not isinstance(content, dict):
             continue
         parts = content.get("parts", [])
+        # Skip any event that contains tool calls or tool responses
         has_tool = any("function_call" in p or "function_response" in p for p in parts)
         if has_tool:
             continue
         for p in parts:
-            txt = p.get("text", "")
-            if not txt or not txt.strip():
+            txt = p.get("text", "").strip()
+            if not txt:
                 continue
-            txt = _strip_waiting_prefix(txt)
-            if txt.strip():
-                text_parts.append(txt)
+            # Skip known intermediate status messages
+            if _INTERMEDIATE_RE.match(txt):
+                print(f"[extract] skip intermediate: {txt[:80]}")
+                continue
+            text_chunks.append(txt)
 
-    return "".join(text_parts)
-
-
-_WAITING_PATTERNS = [
-    "i'm sorry, i cannot fulfill this request",
-    "i am sorry, i cannot fulfill",
-    "i cannot fulfill this request",
-    "i am still waiting",
-    "still waiting for the results",
-    "waiting for the previous request",
-    "previous request to complete",
-    "i'm unable to fulfill",
-]
+    return "".join(text_chunks)
 
 
-def _strip_waiting_prefix(text: str) -> str:
-    """
-    If a text chunk starts with an internal 'waiting for tool' sentence,
-    strip that sentence and return the rest. Otherwise return unchanged.
-    """
-    # The waiting sentence ends at the first period followed by a capital letter
-    lower = text.lower()
-    for pattern in _WAITING_PATTERNS:
-        if pattern in lower:
-            # Find the end of the waiting sentence(s) by looking for a newline
-            # or the start of actual content after the apology block
-            idx = lower.find(pattern)
-            # Advance past the apology block — find next sentence that looks like real content
-            after = text[idx:]
-            # Split on ". " followed by capital or newline
-            import re
-            # Find end of the apology block: look for "complete." or similar ending
-            end_markers = ["complete.", "results.", "finish.", "done."]
-            cut = -1
-            for marker in end_markers:
-                m = after.lower().find(marker)
-                if m != -1:
-                    cut = idx + m + len(marker)
-                    break
-            if cut > 0:
-                remainder = text[cut:].strip()
-                if remainder:
-                    print(f"[extract] stripped waiting prefix, remainder len={len(remainder)}")
-                    return remainder
-            # Fallback: skip the entire chunk if we can't find the end of apology
-            print(f"[extract] skipping waiting chunk: {text[:120]}")
-            return ""
-    return text
+def has_tool_calls(events: list) -> bool:
+    for ev in events:
+        content = ev.get("content", {})
+        if not isinstance(content, dict):
+            continue
+        for p in content.get("parts", []):
+            if "function_call" in p:
+                return True
+    return False
 
 
 async def create_session(client: httpx.AsyncClient, token: str) -> tuple[str, str]:
@@ -187,7 +166,7 @@ async def startup():
 async def query_agent(request: QueryRequest):
     token = get_token()
 
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=120.0) as client:
         session_id, user_id = await create_session(client, token)
         print(f"[query] session_id={session_id} | message={request.message[:80]}")
 
@@ -198,6 +177,9 @@ async def query_agent(request: QueryRequest):
                 "message": request.message,
             }
         }
+
+        accumulated_text = []
+        last_text_round = -1
 
         for round_num in range(1, MAX_ROUNDS + 1):
             print(f"[round {round_num}] calling streamQuery...")
@@ -221,16 +203,27 @@ async def query_agent(request: QueryRequest):
                 part_types = [list(p.keys()) for p in parts]
                 print(f"  {author}: {part_types}")
 
-            text = extract_text(events)
-            if text:
-                print(f"[round {round_num}] GOT TEXT len={len(text)}: {text[:200]}")
-                return {"result": text}
+            text = extract_synthesis_text(events)
+            if text and len(text) >= MIN_SYNTHESIS_LEN:
+                print(f"[round {round_num}] got synthesis text len={len(text)}: {text[:150]}")
+                accumulated_text.append(text)
+                last_text_round = round_num
+
+            # Stop early if: we have substantial text AND this round had no new tool calls
+            if accumulated_text and not has_tool_calls(events):
+                print(f"[round {round_num}] no more tool calls, synthesis complete")
+                break
 
             if round_num < MAX_ROUNDS:
-                print(f"[round {round_num}] no text yet, waiting {ROUND_WAIT_SECS}s...")
+                print(f"[round {round_num}] waiting {ROUND_WAIT_SECS}s...")
                 await asyncio.sleep(ROUND_WAIT_SECS)
 
-    print(f"[query] exhausted {MAX_ROUNDS} rounds with no text")
+        if accumulated_text:
+            combined = "\n\n".join(accumulated_text)
+            print(f"[query] returning combined text len={len(combined)} from {len(accumulated_text)} round(s)")
+            return {"result": combined}
+
+    print(f"[query] exhausted {MAX_ROUNDS} rounds with no synthesis text")
     return {"result": "Agent returned no text. Please try again."}
 
 
