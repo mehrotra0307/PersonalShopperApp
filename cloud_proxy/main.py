@@ -101,27 +101,58 @@ def extract_text(events: list) -> str:
             txt = p.get("text", "")
             if not txt or not txt.strip():
                 continue
-            if _is_waiting_message(txt):
-                print(f"[extract] skipping waiting message: {txt[:100]}")
-                continue
-            text_parts.append(txt)
+            txt = _strip_waiting_prefix(txt)
+            if txt.strip():
+                text_parts.append(txt)
 
     return "".join(text_parts)
 
 
-def _is_waiting_message(text: str) -> bool:
-    """Returns True if this is an internal agent 'still waiting for tool' message."""
+_WAITING_PATTERNS = [
+    "i'm sorry, i cannot fulfill this request",
+    "i am sorry, i cannot fulfill",
+    "i cannot fulfill this request",
+    "i am still waiting",
+    "still waiting for the results",
+    "waiting for the previous request",
+    "previous request to complete",
+    "i'm unable to fulfill",
+]
+
+
+def _strip_waiting_prefix(text: str) -> str:
+    """
+    If a text chunk starts with an internal 'waiting for tool' sentence,
+    strip that sentence and return the rest. Otherwise return unchanged.
+    """
+    # The waiting sentence ends at the first period followed by a capital letter
     lower = text.lower()
-    return any(phrase in lower for phrase in (
-        "i am still waiting",
-        "still waiting for the results",
-        "waiting for the previous request",
-        "previous request to complete",
-        "i cannot fulfill this request",
-        "i'm unable to fulfill",
-        "i already executed",
-        "already executed the `",
-    ))
+    for pattern in _WAITING_PATTERNS:
+        if pattern in lower:
+            # Find the end of the waiting sentence(s) by looking for a newline
+            # or the start of actual content after the apology block
+            idx = lower.find(pattern)
+            # Advance past the apology block — find next sentence that looks like real content
+            after = text[idx:]
+            # Split on ". " followed by capital or newline
+            import re
+            # Find end of the apology block: look for "complete." or similar ending
+            end_markers = ["complete.", "results.", "finish.", "done."]
+            cut = -1
+            for marker in end_markers:
+                m = after.lower().find(marker)
+                if m != -1:
+                    cut = idx + m + len(marker)
+                    break
+            if cut > 0:
+                remainder = text[cut:].strip()
+                if remainder:
+                    print(f"[extract] stripped waiting prefix, remainder len={len(remainder)}")
+                    return remainder
+            # Fallback: skip the entire chunk if we can't find the end of apology
+            print(f"[extract] skipping waiting chunk: {text[:120]}")
+            return ""
+    return text
 
 
 async def create_session(client: httpx.AsyncClient, token: str) -> tuple[str, str]:
