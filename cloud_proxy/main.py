@@ -166,7 +166,7 @@ async def startup():
 async def query_agent(request: QueryRequest):
     token = get_token()
 
-    async with httpx.AsyncClient(timeout=120.0) as client:
+    async with httpx.AsyncClient(timeout=300.0) as client:
         session_id, user_id = await create_session(client, token)
         print(f"[query] session_id={session_id} | message={request.message[:80]}")
 
