@@ -22,8 +22,7 @@ data class ShopperUiState(
     val googleStatus: AgentStatus = AgentStatus.IDLE,
     val redditStatus: AgentStatus = AgentStatus.IDLE,
     val youtubeStatus: AgentStatus = AgentStatus.IDLE,
-    val synthesizerStatus: AgentStatus = AgentStatus.IDLE,
-    val elapsedSeconds: Int = 0
+    val synthesizerStatus: AgentStatus = AgentStatus.IDLE
 )
 
 class ShopperViewModel : ViewModel() {
@@ -36,7 +35,6 @@ class ShopperViewModel : ViewModel() {
             _uiState.value = ShopperUiState(query = query, isLoading = true)
 
             launch { runAnimationTimeline() }
-            launch { runTimer() }
 
             try {
                 val response = RetrofitClient.api.query(QueryRequest(query))
@@ -90,15 +88,6 @@ class ShopperViewModel : ViewModel() {
         delay(1800)
         if (_uiState.value.isLoading) _uiState.update {
             it.copy(youtubeStatus = AgentStatus.DONE, synthesizerStatus = AgentStatus.SEARCHING)
-        }
-    }
-
-    private suspend fun runTimer() {
-        while (_uiState.value.isLoading) {
-            delay(1000)
-            if (_uiState.value.isLoading) {
-                _uiState.update { it.copy(elapsedSeconds = it.elapsedSeconds + 1) }
-            }
         }
     }
 

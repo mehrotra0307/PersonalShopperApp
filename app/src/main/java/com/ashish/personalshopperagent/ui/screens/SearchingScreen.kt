@@ -76,7 +76,6 @@ fun SearchingScreen(
             IconButton(onClick = onBack) { Icon(Icons.Default.ArrowBack, "Back", tint = White) }
             Column {
                 Text("Searching", color = White, fontWeight = FontWeight.Bold, fontSize = 20.sp)
-                Text("${state.elapsedSeconds}s", color = WhiteDim, style = MaterialTheme.typography.labelSmall)
             }
         }
         Spacer(Modifier.height(20.dp))
