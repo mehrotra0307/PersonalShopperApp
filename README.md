@@ -2,6 +2,13 @@
 
 An Android app that uses **3 parallel AI agents** to research any product and give you a synthesized recommendation — pulling from Google Shopping, Reddit reviews, and YouTube reviews simultaneously.
 
+## 🎥 Watch it in action
+
+[![Watch the demo](https://img.youtube.com/vi/EUqtA2WFKK8/maxresdefault.jpg)](https://www.youtube.com/watch?v=EUqtA2WFKK8)
+
+Full project write-up: [ashishmehrotra.com/projects/personal-shopper-agent](https://ashishmehrotra.com/projects/personal-shopper-agent)
+Related blog post: [ashishmehrotra.com/blog/from-laptop-to-production-building-and-deploying-a-multi-agent-ai-system-with-google-adk](https://ashishmehrotra.com/blog/from-laptop-to-production-building-and-deploying-a-multi-agent-ai-system-with-google-adk)
+
 ---
 
 ## What It Does
